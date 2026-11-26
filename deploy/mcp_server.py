@@ -25,6 +25,7 @@ import functools
 import json
 import os
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 from typing import Dict, List
@@ -559,6 +560,10 @@ def build_app() -> Starlette:
     async def lifespan(app):
         async with mcp.session_manager.run():
             async with public_mcp.session_manager.run():
+                # 后台预热 chunks。线上 13.6 万条切片，冷加载要十几秒；
+                # 不预热的话服务刚重启后的第一个检索/取文请求会超时，
+                # 目录站的健康探测也会因此判成不健康。
+                threading.Thread(target=_chunks, daemon=True).start()
                 yield
 
     return Starlette(

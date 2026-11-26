@@ -66,7 +66,7 @@ echo "────────────────────────�
 echo " 4/5  重启服务"
 echo "────────────────────────────────────────"
 systemctl restart fagai-mcp || { echo "✗ 重启失败，回滚"; cp -a "$BAK" mcp_server.py; systemctl restart fagai-mcp; exit 1; }
-sleep 4
+sleep 8
 
 if ! systemctl is-active --quiet fagai-mcp; then
   echo "✗ 服务未起来，回滚"
@@ -136,21 +136,29 @@ if [ -n "$SID" ]; then
   fi
 
   # 5.4 实测调用一次，确认不是只注册了名字
-  EXC=$(curl -fsS -m 25 -X POST http://127.0.0.1:3010/public/mcp \
+  # 超时给到 120 秒：线上 13.6 万条切片，冷加载要十几秒。
+  # 这里故意不加 -f——加了之后超时或 5xx 时 curl 会吞掉 body，
+  # 只剩一句「无返回」，看不出到底卡在哪。
+  EXC=$(curl -sS -m 120 -w "\n__HTTP__%{http_code}" -X POST http://127.0.0.1:3010/public/mcp \
     -H "Content-Type: application/json" \
     -H "Accept: application/json, text/event-stream" \
     -H "Mcp-Session-Id: $SID" \
     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_excerpt","arguments":{"doc_no":"国令第712号","max_chars":300}}}' 2>/dev/null)
 
-  if echo "$EXC" | grep -q '"isError":true'; then
-    echo "✗ get_excerpt 调用报错"
-    echo "$EXC" | head -c 400
+  EXC_CODE=$(echo "$EXC" | grep -o '__HTTP__[0-9]*' | tail -1 | sed 's/__HTTP__//')
+  EXC_BODY=$(echo "$EXC" | sed 's/__HTTP__[0-9]*$//')
+
+  if echo "$EXC_BODY" | grep -q '"isError":true'; then
+    echo "✗ get_excerpt 调用报错（HTTP $EXC_CODE）"
+    echo "$EXC_BODY" | head -c 500
     FAIL=1
-  elif echo "$EXC" | grep -q '"result"'; then
+  elif echo "$EXC_BODY" | grep -q '"result"'; then
     echo "✓ get_excerpt 实测可取正文（政府投资条例）"
   else
-    echo "✗ get_excerpt 调用无返回"
-    echo "$EXC" | head -c 400
+    echo "✗ get_excerpt 调用无返回（HTTP ${EXC_CODE:-超时}）"
+    echo "$EXC_BODY" | head -c 500
+    echo ""
+    echo "  排查：journalctl -u fagai-mcp -n 30 --no-pager"
     FAIL=1
   fi
 fi
