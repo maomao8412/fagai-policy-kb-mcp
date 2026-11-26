@@ -16,12 +16,15 @@ RAW=https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy
 TS=$(date +%Y%m%d-%H%M%S)
 BAK="$APP/mcp_server.py.bak-$TS"
 
-cd "$APP" || { echo "✗ 找不到 $APP"; exit 1; }
-
 if [ "$(id -u)" != "0" ]; then
-  echo "✗ 需要 root 权限，用 sudo bash 跑"
+  echo "✗ 需要 root 权限。当前用户：$(whoami)"
+  echo ""
+  echo "  正确跑法（先下载再提权，别用管道，否则 sudo 读不到密码）："
+  echo "  curl -fsSL https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy/update_mcp.sh -o /tmp/u.sh && sudo bash /tmp/u.sh"
   exit 1
 fi
+
+cd "$APP" || { echo "✗ 找不到 $APP"; exit 1; }
 
 echo "────────────────────────────────────────"
 echo " 1/5  备份现有代码"
@@ -88,10 +91,16 @@ else
 fi
 
 # 5.2 instructions 里不能还是 1200+，且要出现真实量级
-INIT=$(curl -fsS -m 15 -X POST http://127.0.0.1:3010/public/mcp \
+# 注意：MCP Streamable HTTP 是有状态的，tools/list 必须带上 initialize
+# 返回的 Mcp-Session-Id，否则服务端直接 400 "Missing session ID"。
+curl -fsS -m 15 -D /tmp/mcp_init_h.txt -o /tmp/mcp_init_b.txt \
+  -X POST http://127.0.0.1:3010/public/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"verify","version":"1.0"}}}' 2>/dev/null)
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"verify","version":"1.0"}}}' 2>/dev/null
+
+INIT=$(cat /tmp/mcp_init_b.txt 2>/dev/null)
+SID=$(grep -i '^mcp-session-id:' /tmp/mcp_init_h.txt 2>/dev/null | tr -d '\r' | awk '{print $2}' | head -1)
 
 if echo "$INIT" | grep -q "1200+"; then
   echo "✗ instructions 仍是旧的「1200+ 篇」"
@@ -105,19 +114,45 @@ else
   FAIL=1
 fi
 
-# 5.3 公开端点工具数必须是 4
-SID=$(echo "$INIT" | grep -oE '"Mcp-Session-Id"[^,]*' | head -1)
-TOOLS=$(curl -fsS -m 15 -X POST http://127.0.0.1:3010/public/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' 2>/dev/null)
-
-if echo "$TOOLS" | grep -q "get_excerpt"; then
-  echo "✓ 公开端点已含 get_excerpt"
-else
-  echo "✗ 公开端点没有 get_excerpt"
-  echo "$TOOLS" | head -c 400
+if [ -z "$SID" ]; then
+  echo "✗ initialize 没返回 Mcp-Session-Id，握手异常"
   FAIL=1
+fi
+
+# 5.3 公开端点工具数必须是 4（带 session 才拿得到）
+if [ -n "$SID" ]; then
+  TOOLS=$(curl -fsS -m 15 -X POST http://127.0.0.1:3010/public/mcp \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Mcp-Session-Id: $SID" \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' 2>/dev/null)
+
+  if echo "$TOOLS" | grep -q '"get_excerpt"'; then
+    echo "✓ 公开端点已注册 get_excerpt"
+  else
+    echo "✗ 公开端点没有 get_excerpt"
+    echo "$TOOLS" | head -c 400
+    FAIL=1
+  fi
+
+  # 5.4 实测调用一次，确认不是只注册了名字
+  EXC=$(curl -fsS -m 25 -X POST http://127.0.0.1:3010/public/mcp \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "Mcp-Session-Id: $SID" \
+    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_excerpt","arguments":{"doc_no":"国令第712号","max_chars":300}}}' 2>/dev/null)
+
+  if echo "$EXC" | grep -q '"isError":true'; then
+    echo "✗ get_excerpt 调用报错"
+    echo "$EXC" | head -c 400
+    FAIL=1
+  elif echo "$EXC" | grep -q '"result"'; then
+    echo "✓ get_excerpt 实测可取正文（政府投资条例）"
+  else
+    echo "✗ get_excerpt 调用无返回"
+    echo "$EXC" | head -c 400
+    FAIL=1
+  fi
 fi
 
 echo "────────────────────────────────────────"
