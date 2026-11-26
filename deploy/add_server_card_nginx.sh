@@ -148,9 +148,11 @@ cat > "$CARD" <<'CARD_JSON_EOF'
 
 CARD_JSON_EOF
 chmod 644 "$CARD"
-# nginx worker 要能读到这个文件，父目录必须可 traverse
+# nginx worker 要能读到这个文件，父目录必须可 traverse。
+# 只加 o+x 不加 o+r：别人能穿过去拿这一个文件，但列不出目录内容。
 ORIG_APP_MODE=$(stat -c %a /opt/kb_service)
-chmod 755 /opt/kb_service "$CARD_DIR"
+chmod o+x /opt/kb_service
+chmod 755 "$CARD_DIR"
 echo "✓ 已写入 $CARD（$(wc -c < "$CARD") 字节）"
 
 echo "────────────────────────────────────────"
