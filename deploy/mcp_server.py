@@ -24,6 +24,8 @@
 import functools
 import json
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -109,19 +111,166 @@ def _kb():
     return kb_module
 
 
+# ── 正文定位：按 doc_id 建字节偏移索引，不把切片读进内存 ──────
+# 之前这里用 lru_cache 把 13.6 万条切片全量读进来，占 200MB 以上，线上进程
+# 被内核 OOM Killer 反复杀掉（systemd 日志 status=9/KILL）。现在只索引
+# 「文号 / 标题 / 字节区间」，正文按偏移 seek 现读，常驻内存 15MB 左右。
+SPAN_INDEX_NAME = "doc_span.json"
+SCAN_MAX_HITS = 3000          # 兜底扫描时最多接受多少条候选行
+
+_RE_DOC_ID = re.compile(rb'"doc_id"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_RE_DOC_NO = re.compile(rb'"doc_no"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_RE_TITLE = re.compile(rb'"title"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+_span_lock = threading.Lock()
+
+
+def _json_str(raw: bytes) -> str:
+    """反转义 JSON 字符串体。包一层引号交给 json 处理最省事。"""
+    try:
+        return json.loads(b'"' + raw + b'"')
+    except Exception:
+        return raw.decode("utf-8", "replace")
+
+
+def _grab(pattern, raw: bytes) -> str:
+    m = pattern.search(raw)
+    return _json_str(m.group(1)) if m else ""
+
+
+def _span_index_path() -> str:
+    from config import CHUNKS_PATH
+    return os.path.join(os.path.dirname(str(CHUNKS_PATH)), SPAN_INDEX_NAME)
+
+
+def _build_span_index() -> Dict[str, Dict]:
+    """扫一遍 chunks.jsonl，建 doc_id → {文号, 标题, 字节区间}。
+
+    切片按 doc_id 连续排列，相邻切片能拼成一个区间就拼起来，省内存。
+    全程只跑正则不做完整 JSON 解析，几十万行约十几秒。
+    """
+    from config import CHUNKS_PATH
+    idx: Dict[str, Dict] = {}
+    offset = 0
+    with open(CHUNKS_PATH, "rb") as f:
+        for raw in f:
+            size = len(raw)
+            did = _grab(_RE_DOC_ID, raw)
+            if did:
+                rec = idx.get(did)
+                if rec is None:
+                    idx[did] = {"n": _grab(_RE_DOC_NO, raw),
+                                "t": _grab(_RE_TITLE, raw),
+                                "s": [[offset, size]]}
+                else:
+                    last = rec["s"][-1]
+                    if last[0] + last[1] == offset:
+                        last[1] += size
+                    else:
+                        rec["s"].append([offset, size])
+            offset += size
+    return idx
+
+
 @functools.lru_cache(maxsize=1)
-def _chunks() -> List[Dict]:
+def _span_index() -> Dict[str, Dict]:
+    """加载偏移索引，没有就现建并落盘。索引约 3MB，常驻内存 15MB 左右。"""
+    path = _span_index_path()
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    with _span_lock:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        idx = _build_span_index()
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(idx, f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, path)
+        except Exception:
+            pass
+        return idx
+
+
+def _read_spans(spans) -> List[Dict]:
+    """按字节区间把切片读出来。一份文件通常几 KB 到几十 KB。"""
     from config import CHUNKS_PATH
     out: List[Dict] = []
-    with open(CHUNKS_PATH, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    with open(CHUNKS_PATH, "rb") as f:
+        for start, size in spans:
+            f.seek(start)
+            for line in f.read(size).splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return out
+
+
+def _scan_chunks(key: str = "", tkey: str = "") -> List[Dict]:
+    """兜底：索引建不起来时用 grep 扫候选行再逐行校验。
+
+    比索引慢一个数量级，只在 _span_index() 抛异常时才走到这里。
+    必须加 -a：切片文件里有少量非 UTF-8 字节，grep 会判成二进制文件、
+    只回一句 binary file matches 而不输出行，结果就是永远查不到东西。
+    """
+    from config import CHUNKS_PATH
+    key = (key or "").strip()
+    tkey = (tkey or "").strip()
+    needle = key or tkey
+    if not needle:
+        return []
+    probe = "".join(ch for ch in needle if ch not in '"\\')[:12] or needle[:8]
+
+    hits: List[str] = []
+    grep_ok = False
+    try:
+        p = subprocess.Popen(
+            ["grep", "-a", "-n", "-F", "-m", str(SCAN_MAX_HITS), "-e", probe,
+             str(CHUNKS_PATH)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, errors="replace",
+        )
+        for raw in p.stdout:
+            hits.append(raw.partition(":")[2])
+        grep_ok = p.wait(timeout=120) in (0, 1)
+    except Exception:
+        grep_ok = False
+
+    if not grep_ok:
+        hits = []
+        with open(CHUNKS_PATH, encoding="utf-8") as f:
+            for raw in f:
+                if probe in raw:
+                    hits.append(raw)
+                    if len(hits) >= SCAN_MAX_HITS:
+                        break
+
+    out: List[Dict] = []
+    for raw in hits:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            c = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if key:
+            if key in (c.get("doc_no") or ""):
+                out.append(c)
+        elif tkey and tkey in (c.get("title") or ""):
+            out.append(c)
     return out
 
 
@@ -200,14 +349,33 @@ def _locate_doc(doc_no: str = "", title: str = ""):
     if not key and not tkey:
         return None, []
 
-    matched = []
-    for c in _chunks():
-        if key:
-            if key in (c.get("doc_no") or ""):
-                matched.append(c)
-        elif tkey and tkey in (c.get("title") or ""):
-            matched.append(c)
+    # 优先走偏移索引：遍历 2 万多个文件的元数据，毫秒级。
+    try:
+        idx = _span_index()
+    except Exception:
+        idx = None
 
+    if idx:
+        best_id, best_spans, best_size = None, None, 0
+        for did, rec in idx.items():
+            if key:
+                hit = key in (rec.get("n") or "") or key in did
+            else:
+                hit = tkey in (rec.get("t") or "") or tkey in did
+            if not hit:
+                continue
+            spans = rec.get("s") or []
+            size = sum(sp[1] for sp in spans)
+            if size > best_size:
+                best_id, best_spans, best_size = did, spans, size
+        if best_id and best_spans:
+            items = _read_spans(best_spans)
+            if items:
+                items.sort(key=lambda c: c.get("chunk_idx", 0))
+                return best_id, items
+
+    # 索引不可用或没命中，退回 grep 扫描。
+    matched = _scan_chunks(key, tkey)
     if not matched:
         return None, []
 
@@ -414,7 +582,8 @@ def corpus_stats() -> str:
     """
     meta = _meta()
     docs = meta.get("doc_list") or []
-    chunks = _chunks()
+    # 切片总数直接读 meta，不去加载切片文件——全量加载会 OOM。
+    chunks_n = int(meta.get("chunks") or 0)
 
     by_level: Dict[str, int] = {}
     by_prov: Dict[str, int] = {}
@@ -434,7 +603,7 @@ def corpus_stats() -> str:
         "## 发改政策知识库",
         "",
         f"- 文档总数：{len(docs)} 篇",
-        f"- 切片总数：{len(chunks)} 条",
+        f"- 切片总数：{chunks_n} 条",
         f"- 覆盖层级：" + "、".join(
             f"{k} {v} 篇" for k, v in sorted(by_level.items(), key=lambda x: -x[1])),
     ]
@@ -536,18 +705,18 @@ class Guard(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def _warm_chunks() -> None:
-    """后台预热切片索引，加载完打一行日志。
+def _warm_span_index() -> None:
+    """后台把偏移索引建好。
 
-    线上 13.6 万条切片冷加载要几十秒，不预热的话服务刚重启后第一个
-    碰数据的请求会被阻塞到超时。这行日志也是部署脚本判断「可以验了」
-    的依据，别删。
+    这一步只存文号、标题和字节区间，占内存十几 MB，不会重演「全量加载
+    切片被 OOM 杀掉」。不预热的话，服务刚重启后第一次取正文要现建索引，
+    得等十几秒。这行日志也是部署脚本判断「可以验了」的依据，别删。
     """
     try:
-        n = len(_chunks())
-        print(f"[mcp] chunks 预热完成：{n} 条切片已就绪", flush=True)
+        n = len(_span_index())
+        print(f"[mcp] 偏移索引就绪：{n} 个文件可定位", flush=True)
     except Exception as e:
-        print(f"[mcp] chunks 预热失败：{e}", flush=True)
+        print(f"[mcp] 偏移索引构建失败：{e}", flush=True)
 
 
 def build_app() -> Starlette:
@@ -574,10 +743,9 @@ def build_app() -> Starlette:
     async def lifespan(app):
         async with mcp.session_manager.run():
             async with public_mcp.session_manager.run():
-                # 后台预热 chunks。线上 13.6 万条切片，冷加载要十几秒；
-                # 不预热的话服务刚重启后的第一个检索/取文请求会超时，
-                # 目录站的健康探测也会因此判成不健康。
-                threading.Thread(target=_warm_chunks, daemon=True).start()
+                # 后台建偏移索引。别改回全量加载切片——那会把 13.6 万条
+                # 正文读进内存，启动几秒就被内核 OOM Killer 杀掉。
+                threading.Thread(target=_warm_span_index, daemon=True).start()
                 yield
 
     return Starlette(

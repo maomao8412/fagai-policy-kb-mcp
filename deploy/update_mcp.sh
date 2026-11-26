@@ -17,7 +17,7 @@ APP=/opt/kb_service
 RAW_JD=https://cdn.jsdelivr.net/gh/maomao8412/fagai-policy-kb-mcp@main/deploy/mcp_server.py
 RAW_GH=https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy/mcp_server.py
 # 新版的版本标记：有 _warm_chunks 才算拿到对的文件，光看 HTTP 200 不够。
-VERSION_MARK=_warm_chunks
+VERSION_MARK=_warm_span_index
 TS=$(date +%Y%m%d-%H%M%S)
 BAK="$APP/mcp_server.py.bak-$TS"
 
@@ -153,14 +153,14 @@ if [ -n "$SID" ]; then
   fi
 
   # 5.4 实测调用一次，确认不是只注册了名字。
-  # 线上 13.6 万条切片，服务刚重启时后台还在加载，此时调用会被阻塞。
-  # 所以这里轮询：最多 12 轮、每轮 20 秒超时、间隔 5 秒，约 4 分钟上限。
-  echo "  等待切片预热（首次加载 13.6 万条，可能要几十秒）..."
+  # 服务重启后后台线程在建偏移索引（线上 13.6 万条切片，约 20 秒），
+  # 建好之前调用会阻塞等锁，所以超时给足 60 秒，并轮询多轮兜底。
+  echo "  等待偏移索引就绪（首次构建约 20 秒）..."
   EXC_OK=0
   EXC_CODE=""
   EXC_BODY=""
   for i in $(seq 1 12); do
-    EXC=$(curl -sS -m 20 -w "\n__HTTP__%{http_code}" -X POST http://127.0.0.1:3010/public/mcp \
+    EXC=$(curl -sS -m 60 -w "\n__HTTP__%{http_code}" -X POST http://127.0.0.1:3010/public/mcp \
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
       -H "Mcp-Session-Id: $SID" \
@@ -180,6 +180,7 @@ if [ -n "$SID" ]; then
     echo "$EXC_BODY" | head -c 500
     echo ""
     echo "  排查：journalctl -u fagai-mcp -n 30 --no-pager"
+    echo "  若是 status=9/KILL，说明内存被打爆：dmesg | grep -i 'killed process' | tail -5"
     FAIL=1
   else
     echo "✗ get_excerpt 调用无返回（HTTP ${EXC_CODE:-超时}）"
