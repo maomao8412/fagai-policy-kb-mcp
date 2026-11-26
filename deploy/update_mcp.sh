@@ -12,9 +12,12 @@
 set -u
 
 APP=/opt/kb_service
-RAW_BASE=https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy/mcp_server.py
-# raw.githubusercontent.com 有 CDN 缓存（约 5 分钟），不加时间戳会拿到旧文件。
-RAW="$RAW_BASE?t=$(date +%s)"
+# 两个源都试。raw.githubusercontent.com 的 CDN 缓存能扛十几分钟，
+# 刚 push 完访问它会拿到旧文件，?t= 参数也绕不过去；jsdelivr 相对及时。
+RAW_JD=https://cdn.jsdelivr.net/gh/maomao8412/fagai-policy-kb-mcp@main/deploy/mcp_server.py
+RAW_GH=https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy/mcp_server.py
+# 新版的版本标记：有 _warm_chunks 才算拿到对的文件，光看 HTTP 200 不够。
+VERSION_MARK=_warm_chunks
 TS=$(date +%Y%m%d-%H%M%S)
 BAK="$APP/mcp_server.py.bak-$TS"
 
@@ -37,18 +40,30 @@ echo "✓ 已备份到 $BAK"
 echo "────────────────────────────────────────"
 echo " 2/5  拉取新版"
 echo "────────────────────────────────────────"
-if ! curl -fsSL -m 60 "$RAW" -o mcp_server.py.new; then
-  echo "✗ 下载失败，检查服务器能否访问 raw.githubusercontent.com"
+GOT=0
+for U in "$RAW_JD" "$RAW_GH"; do
+  echo "  尝试：$U"
+  if curl -fsSL -m 60 "$U" -o mcp_server.py.new 2>/dev/null; then
+    SIZE=$(wc -c < mcp_server.py.new)
+    if [ "$SIZE" -lt 10000 ]; then
+      echo "    ✗ 内容太小（$SIZE 字节），可能是错误页"
+    elif ! grep -q "$VERSION_MARK" mcp_server.py.new; then
+      echo "    ✗ 拿到的是旧版（缺版本标记 $VERSION_MARK），换下一个源"
+    else
+      GOT=1
+      echo "  ✓ 下载完成，$SIZE 字节，版本标记已确认"
+      break
+    fi
+  else
+    echo "    ✗ 连不上"
+  fi
+done
+
+if [ "$GOT" != "1" ]; then
+  echo "✗ 所有源都拿不到新版。可能刚 push 完 CDN 还没同步，等 5 分钟重跑。"
   rm -f mcp_server.py.new
   exit 1
 fi
-SIZE=$(wc -c < mcp_server.py.new)
-if [ "$SIZE" -lt 10000 ]; then
-  echo "✗ 下载内容异常（只有 $SIZE 字节），中止"
-  rm -f mcp_server.py.new
-  exit 1
-fi
-echo "✓ 下载完成，$SIZE 字节"
 
 echo "────────────────────────────────────────"
 echo " 3/5  语法检查"
