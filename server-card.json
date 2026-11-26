@@ -29,7 +29,7 @@
     "required": false,
     "schemes": []
   },
-  "instructions": "中国发展改革领域政策知识库，覆盖国家政策、省级政策、规划纲要、项目经验四类语料。回答政策依据类问题前先用 search_policy 检索，需要逐条引用原文时再用 get_article 取全文。所有结论都应标注文件名和文号。这是公开只读端点，仅提供检索与统计；取全文需要授权端点。",
+  "instructions": "中国发展改革领域政策知识库，覆盖国家政策、省级政策、规划纲要、项目经验四类语料，共 21,656 篇正式文件、136,155 条切片。回答政策依据类问题前先用 search_policy 检索，需要确认文件身份或看正文开头时用 get_excerpt 取节选，需要逐条引用全文时再用授权端点的 get_article。所有结论都应标注文件名和文号。这是公开只读端点，提供检索、正文节选和统计。",
   "tools": [
     {
       "name": "search_policy",
@@ -54,6 +54,28 @@
         "required": [
           "query"
         ]
+      }
+    },
+    {
+      "name": "get_excerpt",
+      "description": "按文号或标题取政策正文节选（默认前 1200 字，上限 2000 字），返回标题、文号、发文机关、日期、来源链接和正文开头。search_policy 只给片段，找到候选文件后需要确认「是不是这一份」或看发文背景与第一章内容时用这个。完整全文需授权端点。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "doc_no": {
+            "type": "string",
+            "description": "文号，如「国令第712号」「川办发〔2026〕42号」，支持模糊匹配"
+          },
+          "title": {
+            "type": "string",
+            "description": "标题关键词，如「政府投资条例」。doc_no 为空时才用"
+          },
+          "max_chars": {
+            "type": "integer",
+            "default": 1200,
+            "description": "正文返回字数，默认 1200，范围 300~2000"
+          }
+        }
       }
     },
     {
