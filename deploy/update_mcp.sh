@@ -12,7 +12,9 @@
 set -u
 
 APP=/opt/kb_service
-RAW=https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy/mcp_server.py
+RAW_BASE=https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy/mcp_server.py
+# raw.githubusercontent.com 有 CDN 缓存（约 5 分钟），不加时间戳会拿到旧文件。
+RAW="$RAW_BASE?t=$(date +%s)"
 TS=$(date +%Y%m%d-%H%M%S)
 BAK="$APP/mcp_server.py.bak-$TS"
 
@@ -135,25 +137,35 @@ if [ -n "$SID" ]; then
     FAIL=1
   fi
 
-  # 5.4 实测调用一次，确认不是只注册了名字
-  # 超时给到 120 秒：线上 13.6 万条切片，冷加载要十几秒。
-  # 这里故意不加 -f——加了之后超时或 5xx 时 curl 会吞掉 body，
-  # 只剩一句「无返回」，看不出到底卡在哪。
-  EXC=$(curl -sS -m 120 -w "\n__HTTP__%{http_code}" -X POST http://127.0.0.1:3010/public/mcp \
-    -H "Content-Type: application/json" \
-    -H "Accept: application/json, text/event-stream" \
-    -H "Mcp-Session-Id: $SID" \
-    -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_excerpt","arguments":{"doc_no":"国令第712号","max_chars":300}}}' 2>/dev/null)
+  # 5.4 实测调用一次，确认不是只注册了名字。
+  # 线上 13.6 万条切片，服务刚重启时后台还在加载，此时调用会被阻塞。
+  # 所以这里轮询：最多 12 轮、每轮 20 秒超时、间隔 5 秒，约 4 分钟上限。
+  echo "  等待切片预热（首次加载 13.6 万条，可能要几十秒）..."
+  EXC_OK=0
+  EXC_CODE=""
+  EXC_BODY=""
+  for i in $(seq 1 12); do
+    EXC=$(curl -sS -m 20 -w "\n__HTTP__%{http_code}" -X POST http://127.0.0.1:3010/public/mcp \
+      -H "Content-Type: application/json" \
+      -H "Accept: application/json, text/event-stream" \
+      -H "Mcp-Session-Id: $SID" \
+      -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_excerpt","arguments":{"doc_no":"国令第712号","max_chars":300}}}' 2>/dev/null)
+    EXC_CODE=$(echo "$EXC" | grep -o '__HTTP__[0-9]*' | tail -1 | sed 's/__HTTP__//')
+    EXC_BODY=$(echo "$EXC" | sed 's/__HTTP__[0-9]*$//')
+    if echo "$EXC_BODY" | grep -q '"result"'; then EXC_OK=1; break; fi
+    if echo "$EXC_BODY" | grep -q '"isError":true'; then break; fi
+    echo "    第 $i 轮未就绪，5 秒后重试"
+    sleep 5
+  done
 
-  EXC_CODE=$(echo "$EXC" | grep -o '__HTTP__[0-9]*' | tail -1 | sed 's/__HTTP__//')
-  EXC_BODY=$(echo "$EXC" | sed 's/__HTTP__[0-9]*$//')
-
-  if echo "$EXC_BODY" | grep -q '"isError":true'; then
+  if [ "$EXC_OK" = "1" ]; then
+    echo "✓ get_excerpt 实测可取正文（政府投资条例）"
+  elif echo "$EXC_BODY" | grep -q '"isError":true'; then
     echo "✗ get_excerpt 调用报错（HTTP $EXC_CODE）"
     echo "$EXC_BODY" | head -c 500
+    echo ""
+    echo "  排查：journalctl -u fagai-mcp -n 30 --no-pager"
     FAIL=1
-  elif echo "$EXC_BODY" | grep -q '"result"'; then
-    echo "✓ get_excerpt 实测可取正文（政府投资条例）"
   else
     echo "✗ get_excerpt 调用无返回（HTTP ${EXC_CODE:-超时}）"
     echo "$EXC_BODY" | head -c 500

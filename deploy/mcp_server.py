@@ -536,6 +536,20 @@ class Guard(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _warm_chunks() -> None:
+    """后台预热切片索引，加载完打一行日志。
+
+    线上 13.6 万条切片冷加载要几十秒，不预热的话服务刚重启后第一个
+    碰数据的请求会被阻塞到超时。这行日志也是部署脚本判断「可以验了」
+    的依据，别删。
+    """
+    try:
+        n = len(_chunks())
+        print(f"[mcp] chunks 预热完成：{n} 条切片已就绪", flush=True)
+    except Exception as e:
+        print(f"[mcp] chunks 预热失败：{e}", flush=True)
+
+
 def build_app() -> Starlette:
     """一个进程提供四个入口。
 
@@ -563,7 +577,7 @@ def build_app() -> Starlette:
                 # 后台预热 chunks。线上 13.6 万条切片，冷加载要十几秒；
                 # 不预热的话服务刚重启后的第一个检索/取文请求会超时，
                 # 目录站的健康探测也会因此判成不健康。
-                threading.Thread(target=_chunks, daemon=True).start()
+                threading.Thread(target=_warm_chunks, daemon=True).start()
                 yield
 
     return Starlette(
