@@ -61,6 +61,19 @@ for f in $CORE; do
 done
 ok "核心文件都在"
 
+# 目录校验：万一 unit 里的 WorkingDirectory 指向别处（装过两遍、
+# 或从 /root 迁到 /opt 没改 unit），覆盖会改到一份没人用的旧代码上，
+# 用户以为生效了其实线上没变。用两个特征串确认这是真代码目录。
+grep -q "KB_MCP_PORT" "$WD/mcp_server.py" 2>/dev/null \
+  || { bad "$WD/mcp_server.py 里没有 KB_MCP_PORT，不像 MCP 服务代码"; exit 1; }
+grep -q "def charge" "$WD/billing.py" 2>/dev/null \
+  || { bad "$WD/billing.py 里没有 charge()，不像账务模块"; exit 1; }
+if [ ! -f "$WD/billing.db" ]; then
+  bad "$WD 下没有 billing.db —— 线上用户数据不在这，八成找错目录了"
+  exit 1
+fi
+ok "目录校验通过（billing.db 存在，说明是线上在用的那份）"
+
 # ── 1. 备份 ────────────────────────────────────────────────
 say "1/6 备份"
 for f in $CORE; do
