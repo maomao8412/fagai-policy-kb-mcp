@@ -95,7 +95,9 @@ rollback() {
 # ── 2. 下载 ────────────────────────────────────────────────
 say "2/6 下载新版本"
 for f in $ALL; do
-  if ! curl -fsSL --max-time 60 "$RAW/$f" -o "/tmp/new-$f"; then
+  # 加 ?t= 绕 CDN 缓存：raw.githubusercontent.com 对分支名有缓存，
+  # 刚推上去的提交可能几分钟内还拉到旧内容，那样等于没改。
+  if ! curl -fsSL --max-time 60 "$RAW/$f?t=$(date +%s)" -o "/tmp/new-$f"; then
     bad "下载 $f 失败（$RAW/$f）"
     rollback
   fi
@@ -106,6 +108,13 @@ for f in $ALL; do
   fi
   ok "$f  $sz 字节"
 done
+
+# 再确认一遍拿到的是新版而不是缓存里的旧版
+grep -q "def create_api_key" /tmp/new-billing.py \
+  || { bad "下载到的 billing.py 没有 create_api_key，是旧版或缓存"; rollback; }
+grep -q "BILL_UNITS" /tmp/new-mcp_server.py \
+  || { bad "下载到的 mcp_server.py 没有 BILL_UNITS，是旧版或缓存"; rollback; }
+ok "内容校验通过（确认是新版）"
 
 # ── 3. 覆盖 + 语法检查 ─────────────────────────────────────
 say "3/6 覆盖并做语法检查"
