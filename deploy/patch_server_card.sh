@@ -67,7 +67,7 @@ _MCP_SERVER_CARD = {'$schema': 'https://static.modelcontextprotocol.io/schemas/m
                   'resources': {'subscribe': False, 'listChanged': False},
                   'prompts': {'listChanged': False}},
  'authentication': {'required': False, 'schemes': []},
- 'instructions': '中国发展改革领域政策知识库，覆盖国家政策、省级政策、规划纲要、项目经验四类语料，共 21,656 篇正式文件、136,176 '
+ 'instructions': '中国发展改革领域政策知识库，覆盖国家政策、省级政策、规划纲要、项目经验四类语料，共 21,658 篇正式文件、136,176 '
                  '条切片。回答政策依据类问题前先用 search_policy 检索，需要确认文件身份或看正文开头时用 get_excerpt '
                  '取节选，需要逐条引用全文时再用授权端点的 '
                  'get_article。所有结论都应标注文件名和文号。这是公开只读端点，提供检索、正文节选和统计。',
