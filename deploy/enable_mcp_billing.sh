@@ -12,7 +12,7 @@
 #   key 无效                        → 401
 #
 # 用法（在服务器上，root）：
-#   curl -fsSL https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/master/deploy/enable_mcp_billing.sh -o /tmp/b.sh && sudo bash /tmp/b.sh
+#   curl -fsSL https://raw.githubusercontent.com/maomao8412/fagai-policy-kb-mcp/main/deploy/enable_mcp_billing.sh -o /tmp/b.sh && sudo bash /tmp/b.sh
 #
 # 回滚：脚本失败会自动回滚。手工回滚：
 #   cp /opt/kb_service/billing.py.bak-<时间> /opt/kb_service/billing.py
@@ -22,7 +22,7 @@
 set -uo pipefail
 
 REPO="maomao8412/fagai-policy-kb-mcp"
-BRANCH="${BRANCH:-master}"
+BRANCH="${BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}/deploy/payload"
 TS=$(date +%Y%m%d-%H%M%S)
 EP_LOCAL="http://127.0.0.1:3010"
