@@ -25,7 +25,11 @@ REPO="maomao8412/fagai-policy-kb-mcp"
 BRANCH="${BRANCH:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}/deploy/payload"
 TS=$(date +%Y%m%d-%H%M%S)
-EP_LOCAL="http://127.0.0.1:3010"
+# 端口从 unit 里读，别写死——换过端口的话验证会全部打到空气上
+MCP_PORT=$(systemctl show -p Environment fagai-mcp --value 2>/dev/null \
+           | tr ' ' '\n' | grep -oP 'KB_MCP_PORT=\K[0-9]+' | head -1)
+MCP_PORT="${MCP_PORT:-3010}"
+EP_LOCAL="http://127.0.0.1:${MCP_PORT}"
 CORE="billing.py mcp_server.py"          # 要备份的
 ALL="billing.py mcp_server.py make_api_key.py"  # 要下发的
 
@@ -198,19 +202,31 @@ c=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -X POST "$EP_LOCAL/mcp" \
 if [ "$c" = "401" ]; then ok "/mcp 无 token → 401（原有鉴权完好）"
 else bad "/mcp 无 token → $c（应为 401）"; FAIL=1; fi
 
-# d) 工具清单还是 4 个
-if "$PYBIN" - "$WD" <<'PY'
-import sys
-sys.path.insert(0, sys.argv[1])
-import mcp_server as M
-names = sorted(M.BILL_UNITS)
-want = ["corpus_stats", "get_article", "get_excerpt", "list_recent", "search_policy"]
-assert names == want, f"工具清单不符：{names}"
-print("  工具：" + ", ".join(names))
-print("  单价：" + ", ".join(f"{k}={v}" for k, v in M.BILL_UNITS.items()))
-PY
-then ok "工具与单价表正确"
-else bad "工具清单异常"; FAIL=1; fi
+# d) 定价表和工具清单对得上
+# 这里刻意不 import mcp_server：模块级会 build_app()，等于在验证阶段
+# 又拉起一个完整实例，白吃内存，DB 锁住时还会误判成失败。
+if "$PYBIN" - "$WD" <<'PYEOF'
+import ast, sys
+src = open(sys.argv[1] + "/mcp_server.py", encoding="utf-8").read()
+tree = ast.parse(src)
+units = None
+for node in tree.body:
+    if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "BILL_UNITS":
+        units = ast.literal_eval(node.value)
+if units is None:
+    raise SystemExit("找不到 BILL_UNITS")
+want = {"search_policy": 100, "get_excerpt": 300, "get_article": 500,
+        "list_recent": 100, "corpus_stats": 0}
+assert units == want, f"定价表不符：{units}"
+print("  单价：" + ", ".join(f"{k}={v}" for k, v in units.items()))
+PYEOF
+then ok "定价表正确"
+else bad "定价表异常"; FAIL=1; fi
+
+# e) 工具注册数量没变（4 个 add_tool）
+n=$(grep -c "add_tool(" "$WD/mcp_server.py")
+if [ "$n" -ge 8 ]; then ok "工具注册 $n 处（主端点 4 + 公开端点 4）"
+else bad "工具注册只剩 $n 处，可能被改坏了"; FAIL=1; fi
 
 if [ "$FAIL" != "0" ]; then
   bad "验证未全过"
